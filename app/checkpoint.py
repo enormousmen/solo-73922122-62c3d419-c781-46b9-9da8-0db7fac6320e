@@ -84,7 +84,12 @@ def load_checkpoint(runs_dir) -> dict | None:
     final = checkpoint_path(runs_dir)
     if not final.exists():
         return None
-    return torch.load(final, map_location="cpu", weights_only=True)
+    try:
+        return torch.load(final, map_location="cpu", weights_only=True)
+    except FileNotFoundError:
+        # Raced with a concurrent save/force-start removing the file between
+        # the existence check and the open.
+        return None
 
 
 def cleanup_stale_tmp_files(runs_dir) -> list[str]:

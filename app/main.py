@@ -9,19 +9,24 @@ Endpoints (interactive docs at /docs):
     POST /train/resume         continue from the latest checkpoint / paused state
     GET  /train/status         progress and checkpoint health
     GET  /train/losses         per-batch loss history
+    POST /train/lr-probe       compare two candidate learning rates on the next batch
     GET  /train/parameters     download model parameters (.pt) from latest checkpoint
     GET  /train/checkpoint     download the full checkpoint (.pt)
 """
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 from contextlib import asynccontextmanager
 from typing import Any
 
 import torch
 from fastapi import Body, FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field
 
 from .config import load_default_config
 from .trainer import (
@@ -30,6 +35,7 @@ from .trainer import (
     JobManager,
     NotFoundError,
     PauseTimeoutError,
+    ProbeError,
 )
 
 manager: JobManager
@@ -59,6 +65,36 @@ def _conflict(exc: Exception) -> HTTPException:
     return HTTPException(status_code=409, detail=str(exc))
 
 
+def _json_safe(value):
+    """Replace non-finite floats so validation errors can always be encoded."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return repr(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def _validation_error_handler(request, exc: RequestValidationError):
+    """422 with a JSON-safe body (the default handler chokes on inf/NaN input)."""
+    return JSONResponse(
+        status_code=422,
+        content={"detail": _json_safe(jsonable_encoder(exc.errors()))},
+    )
+
+
+class LRProbeRequest(BaseModel):
+    """Two distinct finite positive learning rates to compare."""
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    lr_a: float = Field(strict=True, gt=0,
+                        description="first candidate learning rate (> 0, finite)")
+    lr_b: float = Field(strict=True, gt=0,
+                        description="second candidate learning rate (> 0, finite)")
+
+
 # TEST-ONLY endpoint (enabled via ENABLE_TEST_CRASH_ENDPOINT=1): hard-exit the
 # process with os._exit, simulating SIGKILL / preemption / power loss.  Used by
 # scripts/verify_repro.py; never enable in production.
@@ -80,6 +116,7 @@ def root() -> dict:
             "POST /train/resume",
             "GET /train/status",
             "GET /train/losses",
+            "POST /train/lr-probe",
             "GET /train/parameters",
             "GET /train/checkpoint",
         ],
@@ -147,6 +184,30 @@ def losses(
     limit: int | None = Query(default=None, description="max number of entries"),
 ) -> dict:
     return manager.get_losses(since_step=since_step, limit=limit)
+
+
+@app.post("/train/lr-probe")
+async def lr_probe(req: LRProbeRequest) -> dict:
+    """Compare two candidate learning rates on the checkpoint's next batch.
+
+    Both candidates start from the same most recent successfully saved
+    checkpoint (model + Adam + RNG) and take one update on the same batch;
+    the response reports the eval-mode cross-entropy of that batch before and
+    after each candidate's update, plus the checkpoint's run_id, epoch and
+    batch.  The online job is not modified.  Runs in a thread so status and
+    loss queries stay responsive.
+    """
+    if req.lr_a == req.lr_b:
+        raise HTTPException(status_code=422,
+                            detail="lr_a and lr_b must be different")
+    try:
+        return await asyncio.to_thread(manager.lr_probe, req.lr_a, req.lr_b)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ConflictError as exc:
+        raise _conflict(exc) from exc
+    except ProbeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/train/parameters")

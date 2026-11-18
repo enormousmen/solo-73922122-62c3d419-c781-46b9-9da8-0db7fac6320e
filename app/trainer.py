@@ -24,7 +24,10 @@ Reproducibility design (bit-exact resume):
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import io
+import math
 import random
 import threading
 import time
@@ -73,12 +76,65 @@ class CheckpointSaveError(Exception):
     """500 - pause could not persist a complete checkpoint."""
 
 
+class ProbeError(Exception):
+    """422 - probe request cannot produce a meaningful comparison."""
+
+
 def epoch_permutation(seed: int, epoch: int, n: int) -> list[int]:
     """Deterministic per-epoch shuffle, re-derivable after a restart."""
     rng = random.Random(f"{seed}:{epoch}")
     perm = list(range(n))
     rng.shuffle(perm)
     return perm
+
+
+def dataset_fingerprint(X: torch.Tensor, y: torch.Tensor,
+                        feature_cols: list[str]) -> str:
+    """Content hash identifying the exact training data of a run.
+
+    Stored in every checkpoint so a probe can refuse to evaluate a checkpoint
+    against a dataset it cannot prove was the one the run trained on.
+    """
+    h = hashlib.sha256()
+    h.update(b"classification-v1\0")
+    h.update(",".join(feature_cols).encode("utf-8"))
+    h.update(b"\0")
+    h.update(X.detach().to("cpu", torch.float32).contiguous().numpy().tobytes())
+    h.update(y.detach().to("cpu", torch.int64).contiguous().numpy().tobytes())
+    h.update(repr((int(X.shape[0]), int(X.shape[1]))).encode("ascii"))
+    return h.hexdigest()
+
+
+class _GeneratorDropout(torch.nn.Module):
+    """Dropout that draws its mask from a private generator.
+
+    Used only by the learning-rate probe: it reproduces the exact math of
+    ``torch.nn.functional.dropout`` (``x * mask * (1 / (1 - p))``) while never
+    touching the process-wide torch RNG stream that the online job consumes.
+    """
+
+    def __init__(self, p: float, generator: torch.Generator):
+        super().__init__()
+        self.p = float(p)
+        self.generator = generator
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.p == 0.0:
+            return x
+        keep = 1.0 - self.p
+        mask = torch.empty_like(x).bernoulli_(keep, generator=self.generator)
+        # Same arithmetic as F.dropout on CPU: multiply by the reciprocal of
+        # the keep probability (verified bit-identical on this torch build).
+        return x * mask * (1.0 / keep)
+
+
+def _install_private_dropout(module: torch.nn.Module,
+                             generator: torch.Generator) -> None:
+    for name, child in module.named_children():
+        if isinstance(child, torch.nn.Dropout):
+            setattr(module, name, _GeneratorDropout(child.p, generator))
+        else:
+            _install_private_dropout(child, generator)
 
 
 def _now_iso() -> str:
@@ -100,6 +156,7 @@ class JobManager:
 
         self._cond = threading.Condition()      # guards all mutable fields below
         self._save_lock = threading.Lock()      # serializes checkpoint writes
+        self._probe_lock = threading.Lock()     # serializes learning-rate probes
         self._pause_requested = False
         self._thread: threading.Thread | None = None
         self._resume_rng_state: torch.Tensor | None = None
@@ -136,6 +193,7 @@ class JobManager:
         self.input_dim = int(self.X.shape[1])
         self.num_classes = int(self.y.max().item()) + 1
         self.dataset_path = path
+        self.dataset_hash = dataset_fingerprint(self.X, self.y, self.feature_cols)
 
     def _build_training_objects(self) -> None:
         self.model = build_model(self.input_dim, self.cfg.hidden_dim,
@@ -360,6 +418,14 @@ class JobManager:
             "rng_state": torch.get_rng_state(),
             "started_at": self.started_at,
             "saved_at": _now_iso(),
+            "dataset": {
+                "fingerprint": self.dataset_hash,
+                "num_samples": self.num_samples,
+                "num_features": self.input_dim,
+                "num_classes": self.num_classes,
+                "batches_per_epoch": (self.num_samples + self.cfg.batch_size - 1)
+                                     // self.cfg.batch_size,
+            },
         }
         with self._save_lock:
             if not force and not self.checkpoint_dirty and self._saved_point == point:
@@ -382,6 +448,135 @@ class JobManager:
                 self.last_error = None
                 self._saved_point = point
                 self.last_checkpoint_at = _now_iso()
+
+    # ------------------------------------------------------------------ probe
+
+    def lr_probe(self, lr_a: float, lr_b: float) -> dict:
+        """Evaluate two candidate learning rates on one batch, side by side.
+
+        Both candidates start from the *same* most recent successfully saved
+        checkpoint (model, Adam moments/step counter and torch RNG), replay
+        the same next batch with the same dropout mask, take exactly one Adam
+        step and report the eval-mode cross-entropy of that batch before and
+        after their own update.
+
+        The probe works on private clones and a private RNG generator; it
+        never writes to the online job's model, optimizer, RNG stream or loss
+        history (nor to the checkpoint file), so training with or without
+        probes stays bit-identical.
+        """
+        # Serialize probes: bounded CPU work, no interference between probes.
+        with self._probe_lock:
+            return self._lr_probe_locked(lr_a, lr_b)
+
+    def _lr_probe_locked(self, lr_a: float, lr_b: float) -> dict:
+        ckpt = load_checkpoint(self.runs_dir)
+        if ckpt is None:
+            raise NotFoundError(
+                "no successful checkpoint exists yet; start training first")
+        meta = ckpt.get("dataset") or {}
+        if meta.get("fingerprint") != self.dataset_hash:
+            raise ConflictError(
+                "cannot probe: the checkpoint does not record the dataset it "
+                "was trained on, or the current dataset differs from it, so "
+                "the next batch cannot be confirmed to be the run's data")
+
+        cfg = TrainConfig.from_dict(ckpt["config"])
+        n = self.num_samples
+        bs = cfg.batch_size
+        bpe = (n + bs - 1) // bs
+        ckpt_epoch = int(ckpt["epoch"])
+        ckpt_next_batch = int(ckpt["next_batch"])
+        if not 0 <= ckpt_next_batch <= bpe:
+            raise ConflictError(
+                "cannot probe: checkpoint position "
+                f"epoch={ckpt_epoch} next_batch={ckpt_next_batch} is not a "
+                "valid batch boundary")
+
+        epoch, batch = ckpt_epoch, ckpt_next_batch
+        if batch == bpe:
+            # Saved at the last batch boundary of the epoch: the next batch
+            # is the first batch of the following epoch.
+            epoch, batch = ckpt_epoch + 1, 0
+        if epoch >= cfg.epochs:
+            raise ConflictError(
+                "cannot probe: the checkpoint is at the end of the run "
+                f"(epoch={ckpt_epoch}, next_batch={ckpt_next_batch}, "
+                f"epochs={cfg.epochs}); there is no following batch")
+
+        perm = epoch_permutation(cfg.seed, epoch, n)
+        idx = perm[batch * bs:(batch + 1) * bs]
+        xb, yb = self.X[idx], self.y[idx]
+
+        base_model = self._probe_model(ckpt, cfg)
+        with torch.no_grad():
+            loss_before = float(F.cross_entropy(base_model(xb), yb).item())
+        if not math.isfinite(loss_before):
+            raise ProbeError(
+                "cannot probe: the checkpoint model already produces a "
+                f"non-finite loss on the next batch (loss={loss_before})")
+
+        candidates = []
+        for lr in (lr_a, lr_b):
+            model = copy.deepcopy(base_model)
+            model.train()
+            # Private generator seeded from the checkpoint RNG: both
+            # candidates see the identical dropout mask, and the online job's
+            # global torch RNG is never touched.
+            gen = torch.Generator()
+            gen.set_state(ckpt["rng_state"])
+            _install_private_dropout(model, gen)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+            # Deep copy: load_state_dict shares tensors with the dict it is
+            # given, so both candidates must get their own copy of the Adam
+            # moments / step counter or the second would start from the first
+            # candidate's updated state.
+            optimizer.load_state_dict(copy.deepcopy(ckpt["optimizer_state_dict"]))
+            for group in optimizer.param_groups:
+                group["lr"] = lr
+            optimizer.zero_grad(set_to_none=True)
+            F.cross_entropy(model(xb), yb).backward()
+            optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                loss_after = float(F.cross_entropy(model(xb), yb).item())
+            if not math.isfinite(loss_after):
+                raise ProbeError(
+                    f"lr={lr!r} produced a non-finite eval loss "
+                    f"(before={loss_before}, after={loss_after}); the update "
+                    "diverged, choose a smaller learning rate")
+            candidates.append({
+                "lr": lr,
+                "eval_loss_before": loss_before,
+                "eval_loss_after": loss_after,
+                "delta": loss_after - loss_before,
+            })
+
+        return {
+            "run_id": ckpt["run_id"],
+            "checkpoint": {
+                "epoch": ckpt_epoch,
+                "next_batch": ckpt_next_batch,
+                "completed": bool(ckpt["completed"]),
+                "saved_at": ckpt.get("saved_at"),
+            },
+            "epoch": epoch,
+            "batch": batch,
+            "step": epoch * bpe + batch + 1,
+            "batch_size": int(xb.shape[0]),
+            "eval_loss_before": loss_before,
+            "candidates": candidates,
+        }
+
+    def _probe_model(self, ckpt: dict, cfg: TrainConfig):
+        """Eval-mode clone of the checkpoint model (no global RNG consumed)."""
+        model = build_model(self.input_dim, cfg.hidden_dim, cfg.dropout_p,
+                            self.num_classes, device="meta")
+        model = model.to_empty(device="cpu")
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+        return model
 
     # ----------------------------------------------------------------- queries
 
@@ -411,6 +606,7 @@ class JobManager:
                 "config": self.cfg.to_dict() if self.cfg else None,
                 "dataset": {
                     "path": self.dataset_path,
+                    "fingerprint": self.dataset_hash,
                     "num_samples": self.num_samples,
                     "num_features": self.input_dim,
                     "num_classes": self.num_classes,
